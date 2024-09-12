@@ -48,3 +48,7 @@ variable "sku_size" {
 variable "connection_string_name" {
   default = "MyDbConnection"
 }
+
+variable "app_version" {
+  default = "1.0.0"
+}

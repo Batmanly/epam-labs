@@ -1,0 +1,535 @@
+# Trigger pipeline on feature, bugfix, hotfix, develop, main, main, release branches
+trigger:
+  branches:
+    include:
+      - "feature/*"
+      - "bugfix/*"
+      - "hotfix/*"
+      - "develop"
+      - "main"
+      - "release/*"
+
+# Variable groups for backend and terraform
+variables:
+  group: "backend-variable-group"
+  ${{ if startsWith(variables['Build.SourceBranch'], 'refs/heads/release/') }}:
+    TF_VAR_app_version: ${{ replace(variables['Build.SourceBranch'], 'refs/heads/release/','') }}
+
+# Stages
+stages:
+  # Build stage
+  - stage: Build
+    jobs:
+      - job: Build
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: Bash@3
+            displayName: Validate-Commit-Message
+            inputs:
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/validate-commit.sh"
+              arguments: "$(projectCode)"
+          - task: Bash@3
+            displayName: Validate-Build-Number
+            inputs:
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/validate-build-number.sh"
+              arguments: "$(Build.BuildId) $(Build.BuildNumber)"
+          - task: TerraformInstaller@1
+            displayName: tfInstall
+            inputs:
+              terraformVersion: "$(terraform_version)"
+          - task: Bash@3
+            displayName: Format-Check
+            inputs:
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/format-check.sh"
+          - task: TerraformTaskV4@4
+            displayName: tfInit
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              backendServiceArm: "$(backendServiceArm)"
+              backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+              backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+              backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+              backendAzureRmKey: "$(backendAzureRmKey)"
+          - task: TerraformTaskV4@4
+            displayName: tfValidate
+            inputs:
+              provider: "azurerm"
+              command: "validate"
+      - job: CreateArtifacts
+        dependsOn: Build
+        condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+        steps:
+          - task: CopyFiles@2
+            displayName: copy-files
+            inputs:
+              Contents: "**/*.tf"
+              TargetFolder: "$(build.artifactStagingDirectory)"
+          - task: ArchiveFiles@2
+            displayName: archive-files
+            inputs:
+              rootFolderOrFile: "$(build.artifactStagingDirectory)"
+              includeRootFolder: false
+              archiveType: "zip"
+              archiveFile: "$(build.artifactStagingDirectory)/iac.terraform.$(oldBuildNumber).zip"
+              replaceExistingArchive: true
+          - task: PublishBuildArtifacts@1
+            displayName: publish-artifacts
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "iac-terraform"
+              publishLocation: "Container"
+  - stage: DEV
+    dependsOn: Build
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    variables:
+      - group: "dev-variable-group"
+    jobs:
+      - deployment: TerraformDEV
+        displayName: "Dev Plan"
+        environment: DEV
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    buildType: "current"
+                    downloadType: "single"
+                    artifactName: "iac-terraform"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+                - task: ExtractFiles@1
+                  inputs:
+                    archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+                    destinationFolder: "$(Build.SourcesDirectory)"
+                    cleanDestinationFolder: true
+                    overwriteExistingFiles: false
+                - task: TerraformInstaller@0
+                  inputs:
+                    terraformVersion: "$(terraform_version)"
+                - task: TerraformTaskV4@4
+                  displayName: tfInit
+                  inputs:
+                    provider: "azurerm"
+                    command: "init"
+                    backendServiceArm: "$(backendServiceArm)"
+                    backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+                    backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+                    backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+                    backendAzureRmKey: "$(backendAzureRmKey)"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                - task: TerraformTaskV4@4
+                  displayName: tfPlan
+                  env:
+                    TF_VAR_app_version: "$(TF_VAR_app_version)"
+                    TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+                    TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+                    TF_VAR_ENV: "$(TF_VAR_ENV)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+                  inputs:
+                    provider: "azurerm"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                    environmentServiceNameAzureRM: "$(backendServiceArm)"
+                    command: "plan"
+      - job: "ManauelValidation"
+        dependsOn: TerraformDEV
+        condition: succeeded()
+        pool: server
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: "recep_yoldas@epam.com"
+              approvers: "recep_yoldas@epam.com"
+              instructions: "'Please review the Terraform plan and approve or reject the deployment'"
+      - job: Apply
+        displayName: "Dev Apply"
+        dependsOn: ManauelValidation
+        condition: succeeded()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "iac-terraform"
+              downloadPath: "$(System.ArtifactsDirectory)"
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+              destinationFolder: "$(Build.SourcesDirectory)"
+              cleanDestinationFolder: true
+              overwriteExistingFiles: false
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(terraform_version)"
+          - task: TerraformTaskV4@4
+            displayName: tfInit
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              backendServiceArm: "$(backendServiceArm)"
+              backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+              backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+              backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+              backendAzureRmKey: "$(backendAzureRmKey)"
+              workingDirectory: "$(Build.SourcesDirectory)"
+          - task: TerraformTaskV4@4
+            displayName: tfApply
+            env:
+              TF_VAR_app_version: "$(TF_VAR_app_version)"
+              TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+              TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+              TF_VAR_ENV: "$(TF_VAR_ENV)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+            inputs:
+              provider: "azurerm"
+              command: "apply"
+              workingDirectory: "$(Build.SourcesDirectory)"
+              environmentServiceNameAzureRM: "$(backendServiceArm)"
+  - stage: QA
+    dependsOn: Build
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    variables:
+      - group: "qa-variable-group"
+    jobs:
+      - deployment: TerraformDEV
+        displayName: "QA Plan"
+        environment: QA
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    buildType: "current"
+                    downloadType: "single"
+                    artifactName: "iac-terraform"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+                - task: ExtractFiles@1
+                  inputs:
+                    archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+                    destinationFolder: "$(Build.SourcesDirectory)"
+                    cleanDestinationFolder: true
+                    overwriteExistingFiles: false
+                - task: TerraformInstaller@0
+                  inputs:
+                    terraformVersion: "$(terraform_version)"
+                - task: TerraformTaskV4@4
+                  displayName: tfInit
+                  inputs:
+                    provider: "azurerm"
+                    command: "init"
+                    backendServiceArm: "$(backendServiceArm)"
+                    backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+                    backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+                    backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+                    backendAzureRmKey: "$(backendAzureRmKey)"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                - task: TerraformTaskV4@4
+                  displayName: tfPlan
+                  env:
+                    TF_VAR_app_version: "$(TF_VAR_app_version)"
+                    TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+                    TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+                    TF_VAR_ENV: "$(TF_VAR_ENV)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+                  inputs:
+                    provider: "azurerm"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                    environmentServiceNameAzureRM: "$(backendServiceArm)"
+                    command: "plan"
+      - job: "ManauelValidation"
+        dependsOn: TerraformDEV
+        condition: succeeded()
+        pool: server
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: "recep_yoldas@epam.com"
+              approvers: "recep_yoldas@epam.com"
+              instructions: "'Please review the Terraform plan and approve or reject the deployment'"
+      - job: Apply
+        displayName: "QA Apply"
+        dependsOn: ManauelValidation
+        condition: succeeded()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "iac-terraform"
+              downloadPath: "$(System.ArtifactsDirectory)"
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+              destinationFolder: "$(Build.SourcesDirectory)"
+              cleanDestinationFolder: true
+              overwriteExistingFiles: false
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(terraform_version)"
+          - task: TerraformTaskV4@4
+            displayName: tfInit
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              backendServiceArm: "$(backendServiceArm)"
+              backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+              backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+              backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+              backendAzureRmKey: "$(backendAzureRmKey)"
+              workingDirectory: "$(Build.SourcesDirectory)"
+          - task: TerraformTaskV4@4
+            displayName: tfApply
+            env:
+              TF_VAR_app_version: "$(TF_VAR_app_version)"
+              TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+              TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+              TF_VAR_ENV: "$(TF_VAR_ENV)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+            inputs:
+              provider: "azurerm"
+              command: "apply"
+              workingDirectory: "$(Build.SourcesDirectory)"
+              environmentServiceNameAzureRM: "$(backendServiceArm)"
+  - stage: UAT
+    dependsOn:
+      - DEV
+      - QA
+      - Build
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    variables:
+      - group: "uat-variable-group"
+    jobs:
+      - deployment: TerraformDEV
+        displayName: "UAT Plan"
+        environment: UAT
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    buildType: "current"
+                    downloadType: "single"
+                    artifactName: "iac-terraform"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+                - task: ExtractFiles@1
+                  inputs:
+                    archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+                    destinationFolder: "$(Build.SourcesDirectory)"
+                    cleanDestinationFolder: true
+                    overwriteExistingFiles: false
+                - task: TerraformInstaller@0
+                  inputs:
+                    terraformVersion: "$(terraform_version)"
+                - task: TerraformTaskV4@4
+                  displayName: tfInit
+                  inputs:
+                    provider: "azurerm"
+                    command: "init"
+                    backendServiceArm: "$(backendServiceArm)"
+                    backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+                    backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+                    backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+                    backendAzureRmKey: "$(backendAzureRmKey)"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                - task: TerraformTaskV4@4
+                  displayName: tfPlan
+                  env:
+                    TF_VAR_app_version: "$(TF_VAR_app_version)"
+                    TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+                    TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+                    TF_VAR_ENV: "$(TF_VAR_ENV)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+                  inputs:
+                    provider: "azurerm"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                    environmentServiceNameAzureRM: "$(backendServiceArm)"
+                    command: "plan"
+      - job: "ManauelValidation"
+        dependsOn: TerraformDEV
+        condition: succeeded()
+        pool: server
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: "recep_yoldas@epam.com"
+              approvers: "recep_yoldas@epam.com"
+              instructions: "'Please review the Terraform plan and approve or reject the deployment'"
+      - job: Apply
+        displayName: "UAT Apply"
+        dependsOn: ManauelValidation
+        condition: succeeded()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "iac-terraform"
+              downloadPath: "$(System.ArtifactsDirectory)"
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+              destinationFolder: "$(Build.SourcesDirectory)"
+              cleanDestinationFolder: true
+              overwriteExistingFiles: false
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(terraform_version)"
+          - task: TerraformTaskV4@4
+            displayName: tfInit
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              backendServiceArm: "$(backendServiceArm)"
+              backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+              backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+              backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+              backendAzureRmKey: "$(backendAzureRmKey)"
+              workingDirectory: "$(Build.SourcesDirectory)"
+          - task: TerraformTaskV4@4
+            displayName: tfApply
+            env:
+              TF_VAR_app_version: "$(TF_VAR_app_version)"
+              TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+              TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+              TF_VAR_ENV: "$(TF_VAR_ENV)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+            inputs:
+              provider: "azurerm"
+              command: "apply"
+              workingDirectory: "$(Build.SourcesDirectory)"
+              environmentServiceNameAzureRM: "$(backendServiceArm)"
+  - stage: PROD
+    dependsOn:
+      - UAT
+      - Build
+    condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    variables:
+      - group: "prod-variable-group"
+    jobs:
+      - deployment: TerraformDEV
+        displayName: "PROD Plan"
+        environment: PROD
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    buildType: "current"
+                    downloadType: "single"
+                    artifactName: "iac-terraform"
+                    downloadPath: "$(System.ArtifactsDirectory)"
+                - task: ExtractFiles@1
+                  inputs:
+                    archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+                    destinationFolder: "$(Build.SourcesDirectory)"
+                    cleanDestinationFolder: true
+                    overwriteExistingFiles: false
+                - task: TerraformInstaller@0
+                  inputs:
+                    terraformVersion: "$(terraform_version)"
+                - task: TerraformTaskV4@4
+                  displayName: tfInit
+                  inputs:
+                    provider: "azurerm"
+                    command: "init"
+                    backendServiceArm: "$(backendServiceArm)"
+                    backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+                    backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+                    backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+                    backendAzureRmKey: "$(backendAzureRmKey)"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                - task: TerraformTaskV4@4
+                  displayName: tfPlan
+                  env:
+                    TF_VAR_app_version: "$(TF_VAR_app_version)"
+                    TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+                    TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+                    TF_VAR_ENV: "$(TF_VAR_ENV)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+                    TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+                  inputs:
+                    provider: "azurerm"
+                    workingDirectory: "$(Build.SourcesDirectory)"
+                    environmentServiceNameAzureRM: "$(backendServiceArm)"
+                    command: "plan"
+      - job: "ManauelValidation"
+        dependsOn: TerraformDEV
+        condition: succeeded()
+        pool: server
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: "recep_yoldas@epam.com"
+              approvers: "recep_yoldas@epam.com"
+              instructions: "'Please review the Terraform plan and approve or reject the deployment'"
+      - job: Apply
+        displayName: "PROD Apply"
+        dependsOn: ManauelValidation
+        condition: succeeded()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "iac-terraform"
+              downloadPath: "$(System.ArtifactsDirectory)"
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: "$(System.ArtifactsDirectory)/iac-terraform/*.zip"
+              destinationFolder: "$(Build.SourcesDirectory)"
+              cleanDestinationFolder: true
+              overwriteExistingFiles: false
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(terraform_version)"
+          - task: TerraformTaskV4@4
+            displayName: tfInit
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              backendServiceArm: "$(backendServiceArm)"
+              backendAzureRmResourceGroupName: "$(backendAzureRmResourceGroupName)"
+              backendAzureRmStorageAccountName: "$(backendAzureRmStorageAccountName)"
+              backendAzureRmContainerName: "$(backendAzureRmContainerName)"
+              backendAzureRmKey: "$(backendAzureRmKey)"
+              workingDirectory: "$(Build.SourcesDirectory)"
+          - task: TerraformTaskV4@4
+            displayName: tfApply
+            env:
+              TF_VAR_app_version: "$(TF_VAR_app_version)"
+              TF_VAR_LOCATION: "$(TF_VAR_LOCATION)"
+              TF_VAR_RESOURCE_NAME_PREFIX: "$(TF_VAR_RESOURCE_NAME_PREFIX)"
+              TF_VAR_ENV: "$(TF_VAR_ENV)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_LOGIN)"
+              TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD: "$(TF_VAR_SQL_SERVER_ADMINISTRATOR_PASSWORD)"
+            inputs:
+              provider: "azurerm"
+              command: "apply"
+              workingDirectory: "$(Build.SourcesDirectory)"
+              environmentServiceNameAzureRM: "$(backendServiceArm)"

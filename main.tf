@@ -32,13 +32,16 @@ resource "azurerm_app_service" "app_service" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   app_service_plan_id = azurerm_app_service_plan.app_service_plan.id
-  app_settings        = {}
+  app_settings = {
+    "Version" = var.app_version
+  }
 
   connection_string {
     name  = var.connection_string_name
     type  = "SQLAzure"
     value = "Server=tcp:${azurerm_sql_server.sql_server.fully_qualified_domain_name},1433;Initial Catalog=${azurerm_sql_database.sql_db.name};Persist Security Info=False;User ID=${var.SQL_SERVER_ADMINISTRATOR_LOGIN};Password=${var.SQL_SERVER_ADMINISTRATOR_PASSWORD};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
   }
+
 }
 
 resource "azurerm_app_service_slot" "app_service" {
